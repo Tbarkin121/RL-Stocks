@@ -1,0 +1,6 @@
+kaggle
+kagglehub
+yfinance
+alpha_vantage
+quandl
+stable-baselines

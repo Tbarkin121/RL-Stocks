@@ -1,0 +1,11 @@
+Logging to ./ppo_logs/
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 1.96e+03 |
+|    ep_rew_mean     | 5.99e+07 |
+| time/              |          |
+|    fps             | 519      |
+|    iterations      | 1        |
+|    time_elapsed    | 3        |
+|    total_timesteps | 2048     |
+---------------------------------
