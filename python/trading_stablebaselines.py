@@ -13,7 +13,7 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.logger import configure
 #%%
 class TradingEnv(gym.Env):
-    def __init__(self, data, num_envs=1, initial_balance_range=[0, 10000], transaction_cost=0.001, window_size=10):
+    def __init__(self, data, initial_balance_range=[0, 10000], initial_shares_range=[0, 1000], transaction_cost=0.001, window_size=10):
         super(TradingEnv, self).__init__()
         
         self.data = data
@@ -29,6 +29,10 @@ class TradingEnv(gym.Env):
         
 
         self.initial_balance_range = initial_balance_range
+        self.initial_shares_range = initial_shares_range
+        
+        self.min_balance = initial_balance_range[0]
+        
         self.transaction_cost = transaction_cost
         self.window_size = window_size
 
@@ -58,7 +62,7 @@ class TradingEnv(gym.Env):
         self.balance = np.random.uniform(*self.initial_balance_range)
         self.balance_scaled = self.balance/self.balance_scale
         
-        self.shares = 0
+        self.shares = np.random.uniform(*self.initial_shares_range)
         self.shares_scaled = self.shares/self.shares_scale
         
         self.current_step = np.random.randint(self.window_size, len(self.data) - 365)
@@ -96,7 +100,7 @@ class TradingEnv(gym.Env):
         
         out_of_bounds = self.current_step >= self.num_trading_days
         out_of_time = self.elapsed_days >= self.max_trading_days
-        out_of_money = self.balance < 0 
+        out_of_money = self.balance < self.min_balance 
         
         self.done = out_of_bounds or out_of_time or out_of_money
         terminated = bool(self.done)
@@ -129,12 +133,13 @@ class TradingEnv(gym.Env):
 data_path = "preprocessed_stock_data.csv"
 preprocessed_stock_data_df = pd.read_csv(data_path)
 
-env = TradingEnv(data=preprocessed_stock_data_df)
+initial_balance_range = [1000, 10000]
+env = TradingEnv(data=preprocessed_stock_data_df, initial_balance_range=initial_balance_range)
 check_env(env)  # Validate Gymnasium API compliance
 
 model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./ppo_logs/")
 
-model.learn(total_timesteps=1000000)
+model.learn(total_timesteps=250000)
 
 #%%
 # Save the trained model
@@ -154,7 +159,6 @@ portfolio_values = []
 actions_taken = []
 
 # Run one episode
-env.max_trading_days = 1000
 while not done:
     action, _states = model.predict(obs, deterministic=True)
     obs, reward, terminated, truncated, info = env.step(action)

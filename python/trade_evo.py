@@ -32,7 +32,7 @@ def RandTensorRange(size, min_val, max_val, dtype=torch.float):
 #%%            
             
 class TradingEnv:
-    def __init__(self, data, num_envs=2, initial_balance_range=[0, 10000], transaction_cost=0.001, window_size=10, buffer_horizon=10):
+    def __init__(self, data, num_envs=2, initial_balance_range=[0, 10000], initial_shares_range=[0, 1000], transaction_cost=0.001, window_size=10, buffer_horizon=10):
         """
         Initialize the trading environment.
         
@@ -57,6 +57,7 @@ class TradingEnv:
         self.data_tensor_scaled = torch.tensor(self.scaled_data, dtype=torch.float32)
         self.num_envs = num_envs
         self.initial_balance_range = initial_balance_range
+        self.initial_shares_range = initial_shares_range
         self.transaction_cost = transaction_cost
         self.window_size = window_size
         self.buffer_hor = buffer_horizon
@@ -74,6 +75,7 @@ class TradingEnv:
         self.ticker_data = self.state[:,0:ticker_data_size].view(-1,ticker_data_size)
         self.balance_scaled = self.state[:,ticker_data_size].view(-1,1)
         self.shares_scaled = self.state[:,ticker_data_size+1].view(-1,1)
+        self.inital_value = torch.zeros((self.num_envs,1))
         
         self.balance_scale = 1e6
         self.shares_scale = 1e6
@@ -103,12 +105,19 @@ class TradingEnv:
         Reset the environment for a new episode.
         """
         self.balance[env_ids, :] = RandTensorRange((len(env_ids), 1), self.initial_balance_range[0], self.initial_balance_range[1])
-        self.shares[env_ids, :] = torch.zeros( (len(env_ids), 1))
+        self.shares[env_ids, :] = RandTensorRange((len(env_ids), 1), self.initial_shares_range[0], self.initial_shares_range[1])
         self.balance_scaled = self.balance/self.balance_scale
         self.shares_scaled = self.shares/self.shares_scale
         
+
+        
         self.starting_day[env_ids, :] = RandTensorRange( (len(env_ids), 1), self.window_size, self.num_trading_days-self.max_trading_days, dtype=torch.int)
         self.elapsed_days[env_ids, :] = torch.zeros( (len(env_ids), 1), dtype=torch.int )
+        
+        close_idx = self.column_indices['AAPL_Adj Close']
+        close_data = self.data_tensor[:, close_idx]
+        current_prices = close_data[self.starting_day[env_ids]]
+        self.inital_value[env_ids, :] = self.balance[env_ids, :] + (self.shares[env_ids, :] * current_prices.reshape(-1,1))
         
         # Update ticker_data state for the new day
         current_day = self.starting_day + self.elapsed_days
@@ -134,7 +143,7 @@ class TradingEnv:
             
             
             current_day = self.starting_day + self.elapsed_days
-            close_idx = self.column_indices['AAPL_Close']
+            close_idx = self.column_indices['AAPL_Adj Close']
             close_data = self.data_tensor[:, close_idx]
 
                 
@@ -160,9 +169,10 @@ class TradingEnv:
             self.shares_scaled = self.shares/self.shares_scale
             
             # Reward: Portfolio value change
-            portfolio_value = self.balance + (self.shares * current_prices)
+            self.portfolio_value = self.balance + (self.shares * current_prices)
+
             # reward = portfolio_value - (self.balance + sell_amount - sell_cost + buy_amount + buy_cost)
-            self.reward = portfolio_value / self.reward_scale
+            self.reward = (self.portfolio_value - self.inital_value ) / self.reward_scale
             self.reward = self.reward.squeeze()
             
             self.elapsed_days += 1
@@ -181,7 +191,8 @@ class TradingEnv:
             
             buf_states2 = self.state * torch.ones_like(self.state) # This should be some scaling values 
 
-            [vals, probs] = ValueNet(buf_states2)
+            # [vals, probs] = ValueNet(buf_states2)
+            vals, probs, stds = ValueNet(buf_states2)
             
             self.buffer.update2(self.reward, buf_states2, self.done, vals)
     
@@ -216,7 +227,7 @@ class TradingEnv:
 
     def _get_price(self):
         current_day = self.starting_day + self.elapsed_days
-        return self.data_tensor[current_day, self.column_indices['AAPL_Close']]
+        return self.data_tensor[current_day, self.column_indices['AAPL_Adj Close']]
     
  
 

@@ -21,16 +21,17 @@ import pandas as pd
 
 import matplotlib.pyplot as plt
 
-num_envs = 1024
-horizon = 12
-gamma = 0.99
+num_envs = 2048
+horizon = 24
+gamma = 0.95
 
-num_epochs = 100
-epoch_steps = 1000
+num_epochs = 1000
+epoch_steps = 100
 
 
 entropy_coff_inital = 0.0
-clip_range = 0.2
+clip_range = 0.5
+max_grad_norm = 1.0
             
 torch.set_default_device('cuda')
 
@@ -45,7 +46,7 @@ preprocessed_stock_data_df = pd.read_csv(data_path)
 # Set parameters
 initial_balance_range = [1000, 10000]  # Initial cash balance
 transaction_cost = 0.001  # 0.1% transaction fee
-window_size = 1  # Number of past days to include in state
+window_size = 4  # Number of past days to include in state
 
 # Initialize the trading environment
 env = TradingEnv(data=preprocessed_stock_data_df, 
@@ -53,7 +54,7 @@ env = TradingEnv(data=preprocessed_stock_data_df,
                  initial_balance_range=initial_balance_range, 
                  transaction_cost=transaction_cost, 
                  window_size=window_size,
-                 buffer_horizon=10)
+                 buffer_horizon=horizon)
 
 
 replay_buffer = Buffer(env.buffer_hor, env.num_envs, env.num_actions, env.num_states, 0.99)
@@ -102,6 +103,7 @@ class Policy(torch.nn.Module):
         self.policy2 = nn.Sequential(
                                     nn.Linear(layer3_count, n_actions),
                                     nn.Tanh(),
+                                    # nn.Sigmoid(),
                                     )
         
         self.value1 = nn.Sequential(
@@ -167,9 +169,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 def create_unique_log_dir(base_name="runs/ppo_training"):
     # Start with the base directory name
-    log_dir = base_name
-    counter = 1
     
+    counter = 1
+    log_dir = f"{base_name}_{counter}"
     # Increment the directory name if it already exists
     while os.path.exists(log_dir):
         log_dir = f"{base_name}_{counter}"
@@ -204,27 +206,40 @@ for epoch in range(num_epochs):
         s1, a1, r1, s2, d2, log_probs_old, returns = replay_buffer.get_SARS()
 
         
-        [vals_s1, probs_s1] = Agent(s1)
+        # [vals_s1, probs_s1] = Agent(s1)
+        vals_s1, probs_s1, log_std = Agent(s1)
         
+        # Convert log-std to std
+        std = torch.exp(log_std)
         
         # action_pd_s1 = torch.distributions.Normal(probs_s1[:,:,0], probs_s1[:,:,1])
         
-        action_pd_s1 = torch.distributions.Normal(probs_s1, 0.025*torch.ones_like(probs_s1.detach()))
-        
+        # action_pd_s1 = torch.distributions.Normal(probs_s1, 0.025*torch.ones_like(probs_s1.detach()))
 
-        # td_error = returns - vals_s1.squeeze(-1)
-        advantage = returns - vals_s1.squeeze(-1)
+        action_pd_s1 = torch.distributions.Normal(probs_s1, std)
         
+        
+        ##################
+        # Normalize rewards
+        mean_reward = torch.mean(returns)
+        std_reward = torch.std(returns)
+        normalized_returns = (returns - mean_reward) / (std_reward + 1e-8)
+        
+        # Compute advantages
+        advantage = normalized_returns - vals_s1.squeeze(-1)
 
-        # normalize advantage... (Doesn't Seem to work)
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-        
+        # # td_error = returns - vals_s1.squeeze(-1)
+        # advantage = returns - vals_s1.squeeze(-1)
+        # # normalize advantage... (Doesn't Seem to work)
+        # advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        ##################        
         
         log_probs = action_pd_s1.log_prob(a1)
         ratio = torch.exp(log_probs - log_probs_old)
         
 
         entropy_coff = entropy_coff_inital * (1-(epoch/num_epochs))
+
         # entropy_loss = -action_pd_s1.entropy().mean() * entropy_coff
 
         # entropy_loss = -entropy_coff*torch.mean(-log_probs)
@@ -236,11 +251,11 @@ for epoch in range(num_epochs):
         
         value_loss = mse_loss(vals_s1.squeeze(-1), returns)
         
-        total_loss = policy_loss + value_loss*0.2 + entropy_loss
+        total_loss = policy_loss + value_loss + entropy_loss
         
         agent_optim.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(Agent.parameters(), 0.5) #Max Grad Norm
+        torch.nn.utils.clip_grad_norm_(Agent.parameters(), max_grad_norm) #Max Grad Norm
         agent_optim.step()
 
         
@@ -263,9 +278,10 @@ for epoch in range(num_epochs):
         # Advance Environments  1 Step
         with torch.no_grad():        
             s1, a1, r1, s2, d2, log_probs_old, returns = replay_buffer.get_SARS()
-            [vals, probs] = Agent(s2)
+            # [vals, probs] = Agent(s2)
+            vals, probs, stds = Agent(s2)
             newest_probs = probs[:,0,:]
-            action_pd = torch.distributions.Normal(newest_probs, 0.01*torch.ones_like(newest_probs))
+            action_pd = torch.distributions.Normal(newest_probs, std)
             next_actions = action_pd.sample()
             log_probs_sample = action_pd.log_prob(next_actions)
             env.step(next_actions, log_probs_sample, Agent)
@@ -298,24 +314,32 @@ for epoch in range(num_epochs):
     # Logging to Tensorboard
     writer.add_scalar("Loss/Policy", np.mean(actor_loss_list), epoch)
     writer.add_scalar("Loss/Value", np.mean(critic_loss_list), epoch)
-    writer.add_scalar("Reward/Average per Epoch", average_rewards_per_epoch[-1], epoch)    
+    writer.add_scalar("Returns/Average per Epoch", returns.mean(), epoch)    
     writer.add_scalar("Episode/Average Length", average_episode_length, epoch)
+    writer.add_scalar("Policy/StdDev", torch.mean(std).item(), epoch)
+
     
     with torch.no_grad():
         # Useful extra info
         approx_kl1 = ((torch.exp(ratio) - 1) - ratio).mean() #Stable Baselines 3
         approx_kl2 = (log_probs_old - log_probs).mean()    #Open AI Spinup
         # print('kl approx : {} : {} : {}'.formaWDt(approx_kl1, approx_kl2, ratio.mean()))
+        
+    #################
+    writer.add_scalar("Policy/Entropy", action_pd_s1.entropy().mean().item(), epoch)
+    writer.add_scalar("Policy/KL Divergence", approx_kl2.item(), epoch)
+    #################
     
     # print(Qvals.reshape([siz,siz]))
     
     
 #%%
-torch.save(Agent.state_dict(), "model_name.pth")
+torch.save(Agent.state_dict(), "it_works_ppo_test_2.pth")
 
 #%%
 
 # Reset Environments
+
 env_ids = torch.arange(env.num_envs)
 env.reset_idx(env_ids)
 
@@ -324,40 +348,37 @@ total_reward = 0
 portfolio_values = []
 actions_taken = []
 
+
 # Run one episode
-env.max_trading_days = 1000
-
-state = env.state
-[vals_s1, probs_s1] = Agent(state)
-
-# while not done:
-#     state = env.state
-#     [vals_s1, probs_s1] = Agent(state)
+while not done:
+    state = env.state
+    vals, probs, stds = Agent(state)
     
-    # env.step(next_actions, log_probs_sample, Agent)
+    action_pd = torch.distributions.Normal(probs, std)
+    next_actions = probs
+    log_probs_sample = action_pd.log_prob(next_actions)
+    env.step(next_actions, log_probs_sample, Agent)
+    
+    done = env.done[0]
 
-    # # print(env.done)
-    # # print(env.elapsed_days)
-    # # print(next_actions)
+
     
     
-    # env_ids = env.done.view(-1).nonzero(as_tuple=False).squeeze(-1)
-    # if len(env_ids) > 0:
-    #     episode_lengths.extend(env.elapsed_days[env_ids].cpu().numpy().tolist())
-    #     env.reset_idx(env_ids)
-        
-    # action, _states = model.predict(obs, deterministic=True)
-    # obs, reward, terminated, truncated, info = env.step(action)
-    # done = terminated or truncated
+    total_reward += env.reward[0]
+    # portfolio_value = env.balance[0] + env.shares[0] * env._get_price()[0]
+    portfolio_value = env.portfolio_value[0]
+    portfolio_values.append(portfolio_value.cpu().detach().numpy())
+    actions_taken.append(next_actions[0].cpu().detach().numpy())  # Record actions
 
-    # total_reward += reward
-    # portfolio_value = env.balance + env.shares * env._get_price()
-    # portfolio_values.append(portfolio_value)
-    # actions_taken.append(action)  # Record actions
 
+    print(env.elapsed_days[0].cpu().detach().numpy())
+    print(next_actions[0].cpu().detach().numpy())
+    # print(probs)
+    # print(env.portfolio_value.cpu().detach().numpy())
     # env.render()  # Optional: Display the current state
 
-#%%
+
+plt.close('all')
 # Convert actions to a NumPy array for easier plotting
 actions_taken = np.array(actions_taken)
 
